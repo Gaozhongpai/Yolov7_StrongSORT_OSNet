@@ -17,37 +17,39 @@ from numpy import random
 
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # yolov5 strongsort root directory
+ROOT = FILE.parents[0]  # yolov7hand strongsort root directory
 WEIGHTS = ROOT / 'weights'
 
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-if str(ROOT / 'yolov7') not in sys.path:
-    sys.path.append(str(ROOT / 'yolov7'))  # add yolov5 ROOT to PATH
-if str(ROOT / 'strong_sort') not in sys.path:
-    sys.path.append(str(ROOT / 'strong_sort'))  # add strong_sort ROOT to PATH
+if str(ROOT / 'yolov7hand') not in sys.path:
+    sys.path.append(str(ROOT / 'yolov7hand'))  # add yolov5 ROOT to PATH
+if str(ROOT / 'trackers' / 'strong_sort') not in sys.path:
+    sys.path.append(str(ROOT / 'trackers' / 'strong_sort'))  # add strong_sort ROOT to PATH
+if str(ROOT / 'trackers' / 'ocsort') not in sys.path:
+    sys.path.append(str(ROOT / 'trackers' / 'ocsort'))  # add strong_sort ROOT to PATH
+if str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid') not in sys.path:
+    sys.path.append(str(ROOT / 'trackers' / 'strong_sort' / 'deep' / 'reid' / 'torchreid'))  # add strong_sort ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-
-from yolov7.models.experimental import attempt_load
-from yolov7.utils.datasets import LoadImages, LoadStreams
-from yolov7.utils.general import (check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
-                                  check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, check_file)
-from yolov7.utils.torch_utils import select_device, time_synchronized
-from yolov7.utils.plots import plot_one_box
-from strong_sort.utils.parser import get_config
-from strong_sort.strong_sort import StrongSORT
-
+import logging
+from yolov7hand.models.experimental import attempt_load
+from yolov7hand.utils.datasets import LoadImages, LoadStreams
+from yolov7hand.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
+                                  check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, print_args, check_file)
+from yolov7hand.utils.torch_utils import select_device, time_synchronized, TracedModel
+from yolov7hand.utils.plots import plot_one_box, save_one_box
+from trackers.multi_tracker_zoo import create_tracker
 
 VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
-
+logging.getLogger().removeHandler(logging.getLogger().handlers[0])
 
 @torch.no_grad()
 def run(
         source='0',
-        yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
-        strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
-        config_strongsort=ROOT / 'strong_sort/configs/strong_sort.yaml',
+        yolo_weights=WEIGHTS / 'yolov7hand.pt',  # model.pt path(s),
+        appearance_descriptor_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
+        tracking_method='strongsort',
         imgsz=(640, 640),  # inference size (height, width)
         conf_thres=0.25,  # confidence threshold
         iou_thres=0.45,  # NMS IOU threshold
@@ -67,12 +69,13 @@ def run(
         project=ROOT / 'runs/track',  # save results to project/name
         name='exp',  # save results to project/name
         exist_ok=False,  # existing project/name ok, do not increment
-        line_thickness=3,  # bounding box thickness (pixels)
+        line_thickness=2,  # bounding box thickness (pixels)
         hide_labels=False,  # hide labels
         hide_conf=False,  # hide confidences
         hide_class=False,  # hide IDs
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        eval=False,  # run multi-gpu eval
 ):
 
     source = str(source)
@@ -91,7 +94,7 @@ def run(
         yolo_weights = Path(yolo_weights[0])
     else:  # multiple models after --yolo_weights
         exp_name = 'ensemble'
-    exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
+    exp_name = name # if name else exp_name + "_" + strong_sort_weights.stem
     save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
     save_dir = Path(save_dir)
     (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
@@ -101,6 +104,10 @@ def run(
     
     WEIGHTS.mkdir(parents=True, exist_ok=True)
     model = attempt_load(Path(yolo_weights), map_location=device)  # load FP32 model
+    model = TracedModel(model, device, 640)
+    if half:
+        model.half()  # to FP16
+
     names, = model.names,
     stride = model.stride.max()  # model stride
     imgsz = check_img_size(imgsz[0], s=stride.cpu().numpy())  # check image size
@@ -112,35 +119,19 @@ def run(
         dataset = LoadStreams(source, img_size=imgsz, stride=stride.cpu().numpy())
         nr_sources = 1
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
+        dataset = LoadImages(source, img_size=imgsz, stride=stride.cpu().numpy())
         nr_sources = 1
     vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
 
-    # initialize StrongSORT
-    cfg = get_config()
-    cfg.merge_from_file(opt.config_strongsort)
-
     # Create as many strong sort instances as there are video sources
-    strongsort_list = []
+    tracker_list = []
     for i in range(nr_sources):
-        strongsort_list.append(
-            StrongSORT(
-                strong_sort_weights,
-                device,
-                half,
-                max_dist=cfg.STRONGSORT.MAX_DIST,
-                max_iou_distance=cfg.STRONGSORT.MAX_IOU_DISTANCE,
-                max_age=cfg.STRONGSORT.MAX_AGE,
-                n_init=cfg.STRONGSORT.N_INIT,
-                nn_budget=cfg.STRONGSORT.NN_BUDGET,
-                mc_lambda=cfg.STRONGSORT.MC_LAMBDA,
-                ema_alpha=cfg.STRONGSORT.EMA_ALPHA,
-
-            )
-        )
-        strongsort_list[i].model.warmup()
+        tracker = create_tracker(tracking_method, appearance_descriptor_weights, device, half)
+        tracker_list.append(tracker, )
+        if hasattr(tracker_list[i], 'model'):
+            if hasattr(tracker_list[i].model, 'warmup'):
+                tracker_list[i].model.warmup()
     outputs = [None] * nr_sources
-    
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
 
     # Run tracking
@@ -166,7 +157,7 @@ def run(
         # Apply NMS
         pred = non_max_suppression(pred[0], conf_thres, iou_thres, classes, agnostic_nms)
         dt[2] += time_synchronized() - t3
-        
+
         # Process detections
         for i, det in enumerate(pred):  # detections per image
             seen += 1
@@ -187,19 +178,18 @@ def run(
                 else:
                     txt_file_name = p.parent.name  # get folder name containing current img
                     save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
-
             curr_frames[i] = im0
 
             txt_path = str(save_dir / 'tracks' / txt_file_name)  # im.txt
             s += '%gx%g ' % im.shape[2:]  # print string
             imc = im0.copy() if save_crop else im0  # for save_crop
 
-            if cfg.STRONGSORT.ECC:  # camera motion compensation
-                strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
+            # if cfg.STRONGSORT.ECC:  # camera motion compensation
+            #     strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()  # xyxy
 
                 # Print results
                 for c in det[:, -1].unique():
@@ -212,7 +202,7 @@ def run(
 
                 # pass detections to strongsort
                 t4 = time_synchronized()
-                outputs[i] = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
+                outputs[i] = tracker_list[i].update(det.cpu(), im0)
                 t5 = time_synchronized()
                 dt[3] += t5 - t4
 
@@ -245,11 +235,11 @@ def run(
                                 txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
                                 save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
 
-                print(f'{s}Done. YOLO:({t3 - t2:.3f}s), StrongSORT:({t5 - t4:.3f}s)')
+                LOGGER.info(f'{s}Done. yolo:({t3 - t2:.3f}s), {tracking_method}:({t5 - t4:.3f}s)')
 
             else:
-                strongsort_list[i].increment_ages()
-                print('No detections')
+                # strongsort_list[i].increment_ages()
+                LOGGER.info('No detections')
 
             # Stream results
             if show_vid:
@@ -276,21 +266,21 @@ def run(
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
-    print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape {(1, 3, imgsz, imgsz)}' % t)
+    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape {(1, 3, *imgsz)}' % t)
     if save_txt or save_vid:
         s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
-        print(f"Results saved to {colorstr('bold', save_dir)}{s}")
+        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(yolo_weights)  # update model (to fix SourceChangeWarning)
 
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov7.pt', help='model.pt path(s)')
-    parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
-    parser.add_argument('--config-strongsort', type=str, default='strong_sort/configs/strong_sort.yaml')
+    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov7hand.pt', help='model.pt path(s)')
+    parser.add_argument('--appearance-descriptor-weights', type=Path, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
+    parser.add_argument('--tracking-method', type=str, default='strongsort', help='strongsort, ocsort, bytetrack')
     parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
-    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640, 640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
@@ -310,15 +300,16 @@ def parse_opt():
     parser.add_argument('--project', default=ROOT / 'runs/track', help='save results to project/name')
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--line-thickness', default=3, type=int, help='bounding box thickness (pixels)')
+    parser.add_argument('--line-thickness', default=2, type=int, help='bounding box thickness (pixels)')
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--hide-class', default=False, action='store_true', help='hide IDs')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--eval', action='store_true', help='run evaluation')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-
+    print_args(vars(opt))
     return opt
 
 

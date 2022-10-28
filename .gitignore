@@ -1,1 +1,5 @@
 .vscode/
+runs
+*.mp4
+weights/*
+*.pt*

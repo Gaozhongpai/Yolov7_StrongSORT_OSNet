@@ -4,3 +4,6 @@
 [submodule "yolov7"]
 	path = yolov7
 	url = https://github.com/mikel-brostrom/yolov7
+[submodule "yolov7hand"]
+	path = yolov7hand
+	url = https://github.com/Gaozhongpai/yolov7.git
